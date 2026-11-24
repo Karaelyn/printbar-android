@@ -1,0 +1,44 @@
+plugins { id 'com.android.application' }
+
+def buildNo = (System.getenv("GITHUB_RUN_NUMBER") ?: "1") as Integer
+
+android {
+    namespace 'app.printbar'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'app.printbar'
+        minSdk 26
+        targetSdk 35
+        versionCode buildNo
+        versionName "1.0.${buildNo}"
+    }
+
+    // Clé de signature fournie par le secret GitHub SIGNING_KEY (keystore en base64), décodée par le workflow.
+    // Sans elle, l'APK est signé avec une clé de debug (installable, mais chaque build aura une clé différente).
+    def ks = file('signing.jks')
+    signingConfigs {
+        release {
+            if (ks.exists()) {
+                storeFile ks
+                storePassword System.getenv("SIGNING_PASSWORD") ?: 'printbar'
+                keyAlias 'printbar'
+                keyPassword System.getenv("SIGNING_PASSWORD") ?: 'printbar'
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig ks.exists() ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
