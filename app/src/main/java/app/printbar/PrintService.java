@@ -11,26 +11,23 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.service.quicksettings.TileService;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-/** Service de premier plan : interroge chaque machine et tient à jour une notification de progression par machine. */
+/** Service de premier plan : interroge chaque machine et tient à jour une notification unique regroupant toutes les machines. */
 public class PrintService extends Service {
 
     public static final String ACTION_STOP = "app.printbar.STOP";
     static final String CH_PROGRESS = "progress";
     static final String CH_ALERTS = "alerts";
-    static final int ID_BASE = 100;   // notification de progression de la machine i : 100 + i
-    static final int ID_ALERT = 200;  // alerte de la machine i : 200 + i
+    static final int ID_BASE = 100;   // notification unique (toutes les machines)
 
     /** Une machine surveillée et son dernier état connu (lu par l'activité et la tuile). */
     public static final class Watch {
@@ -91,15 +88,15 @@ public class PrintService extends Service {
         List<Cosmos> clients = Prefs.printers(this);
         if (clients.isEmpty()) clients.add(new Cosmos(Prefs.DEFAULT_URL));
 
-        // (Re)démarrage : on arrête les anciennes boucles et on efface les notifications en trop
+        // (Re)démarrage : on arrête les anciennes boucles (et les notifications par machine de la v1.1)
         stopWatches();
-        for (int i = clients.size(); i < 20; i++) nm.cancel(ID_BASE + i);
+        for (int i = 1; i < 20; i++) nm.cancel(ID_BASE + i);
 
         List<Watch> list = new ArrayList<>();
         for (int i = 0; i < clients.size(); i++) list.add(new Watch(i, clients.get(i)));
         watches = list;
 
-        Notification first = build(list.get(0), null);
+        Notification first = buildAll();
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(ID_BASE, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         } else {
@@ -110,7 +107,6 @@ public class PrintService extends Service {
         refreshTile();
 
         for (Watch w : list) {
-            if (w.index > 0) nm.notify(ID_BASE + w.index, build(w, null));
             w.thread = new HandlerThread("printbar-" + w.index);
             w.thread.start();
             w.handler = new Handler(w.thread.getLooper());
@@ -130,7 +126,7 @@ public class PrintService extends Service {
         running = false;
         Prefs.get(this).edit().putBoolean(Prefs.ENABLED, false).apply();
         stopWatches();
-        for (Watch w : watches) nm.cancel(ID_BASE + w.index);
+        nm.cancel(ID_BASE);
         releaseWake();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
@@ -156,8 +152,8 @@ public class PrintService extends Service {
         w.last = s;
         if (!running || !watches.contains(w)) return;
 
-        nm.notify(ID_BASE + w.index, build(w, s));
         alertOnTransition(w, w.prev, s);
+        postAll();
         w.prev = s.state;
         updateWake();
         refreshTile();
@@ -205,114 +201,55 @@ public class PrintService extends Service {
             default: break;
         }
         if (title == null) return;
-        Notification n = new Notification.Builder(this, CH_ALERTS)
-                .setSmallIcon(R.drawable.ic_printer)
-                .setContentTitle(w.client.label() + " — " + title)
-                .setContentText(text)
-                .setContentIntent(openMachine(w))
-                .setAutoCancel(true)
-                .build();
-        nm.notify(ID_ALERT + w.index, n);
+        // Tout reste dans la notification unique : on la republie une fois sur le canal « Alertes » (son + bandeau)
+        alertText = w.client.label() + " — " + title + (text == null || text.isEmpty() ? "" : " · " + text);
+        alertPending = true;
     }
 
-    private PendingIntent openMachine(Watch w) {
-        Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(w.client.clickUrl()));
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        return PendingIntent.getActivity(this, 10 + w.index, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+    private final Handler main = new Handler(android.os.Looper.getMainLooper());
+    private boolean postScheduled;
+    private volatile boolean alertPending;
+    private volatile String alertText;
+
+    /** Regroupe les mises à jour des machines en une seule publication (300 ms). */
+    private void postAll() {
+        synchronized (this) {
+            if (postScheduled) return;
+            postScheduled = true;
+        }
+        main.postDelayed(() -> {
+            synchronized (PrintService.this) { postScheduled = false; }
+            if (!running) return;
+            boolean alert = alertPending;
+            alertPending = false;
+            nm.notify(ID_BASE, buildAll(alert));
+        }, 300);
     }
 
-    private Notification build(Watch w, Cosmos.Status s) {
-        String label = w.client.label();
-        Notification.Builder b = new Notification.Builder(this, CH_PROGRESS)
+    private Notification buildAll() { return buildAll(false); }
+
+    private Notification buildAll(boolean alert) {
+        List<Watch> ws = watches;
+        Notification.Builder b = new Notification.Builder(this, alert ? CH_ALERTS : CH_PROGRESS)
                 .setSmallIcon(R.drawable.ic_printer)
                 .setOngoing(true)
-                .setOnlyAlertOnce(true)
+                .setOnlyAlertOnce(!alert)
                 .setShowWhen(false)
                 .setCategory(Notification.CATEGORY_PROGRESS)
-                .setSortKey(String.format(Locale.ROOT, "%02d", w.index))
-                .setContentIntent(openMachine(w));
+                .setStyle(new Notification.DecoratedCustomViewStyle())
+                .setCustomContentView(Notif.bar(this, ws))
+                .setCustomBigContentView(Notif.cards(this, ws))
+                .setContentTitle("PrintBar")
+                .setSubText(Notif.summary(ws))
+                .setTicker(alert ? alertText : null)
+                .setContentIntent(PendingIntent.getActivity(this, 3,
+                        new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE));
         if (Build.VERSION.SDK_INT >= 31) b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
-
         PendingIntent stop = PendingIntent.getService(this, 2,
                 new Intent(this, PrintService.class).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE);
-        PendingIntent app = PendingIntent.getActivity(this, 3,
-                new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         b.addAction(new Notification.Action.Builder(null, "Arrêter le suivi", stop).build());
-        b.addAction(new Notification.Action.Builder(null, "Réglages", app).build());
-
-        String chip = null;
-        if (s == null) {
-            b.setContentTitle(label).setContentText("Connexion…").setProgress(0, 0, true);
-        } else {
-            String file = Cosmos.name(s.file);
-            int pct = (int) Math.floor(s.progress * 100);
-            String temps = temps(s);
-            String ident = ident(s);
-            switch (s.state) {
-                case PRINTING:
-                case PAUSED: {
-                    boolean paused = s.state == Cosmos.State.PAUSED;
-                    boolean heating = s.heating();
-                    StringBuilder line = new StringBuilder();
-                    if (paused) line.append("En pause · ");
-                    if (heating) {
-                        line.append("Chauffe · buse ").append(Math.round(s.ext)).append("/").append(Math.round(s.extT)).append(" °C");
-                    } else {
-                        line.append(pct).append(" %");
-                        if (s.totalLayers > 0) line.append(" · couche ").append(s.layer).append("/").append(s.totalLayers);
-                        if (s.remainingS >= 0) line.append(" · reste ").append(Cosmos.dur(s.remainingS));
-                    }
-                    b.setContentTitle(label + (file.isEmpty() ? "" : " — " + file))
-                            .setContentText(line)
-                            .setSubText(!heating && s.remainingS >= 0 ? "fin " + endTime(s.remainingS) : null);
-                    if (heating) b.setProgress(0, 0, true);
-                    else b.setProgress(1000, (int) (s.progress * 1000), false);
-                    StringBuilder big = new StringBuilder(line);
-                    if (!file.isEmpty()) big.append("\nFichier : ").append(file);
-                    if (s.elapsedS >= 0) big.append("\nÉcoulé ").append(Cosmos.dur(s.elapsedS));
-                    if (!temps.isEmpty()) big.append("\n").append(temps);
-                    if (!ident.isEmpty()) big.append("\n").append(ident);
-                    b.setStyle(new Notification.BigTextStyle().bigText(big));
-                    chip = heating ? "Chauffe" : (paused ? "⏸ " + pct + " %" : pct + " %");
-                    break;
-                }
-                case COMPLETE:
-                    b.setContentTitle(label + " — Terminé ✓")
-                            .setContentText(file + (s.elapsedS > 0 ? " · " + Cosmos.dur(s.elapsedS) : ""))
-                            .setProgress(1000, 1000, false);
-                    break;
-                case CANCELLED:
-                    b.setContentTitle(label + " — Annulé").setContentText(file);
-                    break;
-                case ERROR:
-                    b.setContentTitle(label + " — Erreur").setContentText(s.message);
-                    break;
-                case OFFLINE:
-                    b.setContentTitle(label + " — Injoignable").setContentText(s.message);
-                    break;
-                default:
-                    b.setContentTitle(label + " — Prête")
-                            .setContentText(temps.isEmpty() ? w.client.host() : temps);
-                    if (!ident.isEmpty()) b.setStyle(new Notification.BigTextStyle()
-                            .bigText((temps.isEmpty() ? "" : temps + "\n") + ident));
-                    break;
-            }
-        }
-        promote(b, chip);
         return b.build();
-    }
-
-    /** Android 16 : demande une notification "Live Update" avec pastille dans la barre d'état. */
-    private static void promote(Notification.Builder b, String chip) {
-        if (Build.VERSION.SDK_INT < 36) return;
-        Bundle ex = new Bundle();
-        ex.putBoolean("android.requestPromotedOngoing", chip != null);
-        b.addExtras(ex);
-        if (chip == null) return;
-        try {
-            Method m = Notification.Builder.class.getMethod("setShortCriticalText", String.class);
-            m.invoke(b, chip);
-        } catch (Exception ignored) { }
     }
 
     static String temps(Cosmos.Status s) {

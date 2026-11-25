@@ -1,6 +1,6 @@
 # PrintBar Android
 
-Avancement des imprimantes 3D (API CosmOS) dans les notifications Android : une notification avec barre de progression par machine.
+Avancement des imprimantes 3D (API CosmOS) dans une notification Android unique, calquée sur PrintBar PC : un segment par machine (nom, %, barre, temps restant + heure de fin), et une carte de détail par machine quand on déplie.
 
 - Plusieurs machines (réglages : une adresse par ligne, ou « Nom = adresse »).
 - Sans nom, une machine s'affiche « IP · fin du SN » (SN lu via /api/machine/device, ou /api/machine/profile sur les anciens logiciels CosmOS).
