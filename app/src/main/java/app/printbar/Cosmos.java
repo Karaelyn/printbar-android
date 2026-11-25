@@ -1,5 +1,7 @@
 package app.printbar;
 
+import android.net.Uri;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -21,13 +23,28 @@ public final class Cosmos {
         public int layer, totalLayers;
         public long elapsedS = -1, remainingS = -1;
         public double ext, extT, bed, bedT;
+        public Double chamber;
         public boolean hasTemps;
+        public String serial = "", model = "", firmware = "";
+
+        /** En impression mais buse encore en chauffe (non détectable sans consigne, ex. ancien logiciel). */
+        public boolean heating() {
+            return state == State.PRINTING && progress < 0.001 && extT > 0 && ext < extT - 3;
+        }
+        public boolean active() { return state == State.PRINTING || state == State.PAUSED; }
     }
 
     private final String base;
+    public final String name; // nom saisi par l'utilisateur ("" = IP · fin du SN)
     private Double factor; // secondes par unité de print_time / eta (null = pas encore déduit)
+    private String serial = "", model = "", firmware = "";
+    private boolean deviceUnsupported; // anciens logiciels CosmOS : pas de /api/machine/device
+    private long nextIdentityTry;
 
-    public Cosmos(String url) {
+    public Cosmos(String url) { this("", url); }
+
+    public Cosmos(String name, String url) {
+        this.name = name == null ? "" : name.trim();
         String u = url.trim();
         if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://" + u;
         while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
@@ -36,6 +53,31 @@ public final class Cosmos {
 
     public String baseUrl() { return base; }
 
+    public String host() {
+        try { String h = Uri.parse(base).getHost(); return h != null ? h : base; } catch (Exception e) { return base; }
+    }
+
+    /** Page ouverte au clic. */
+    public String clickUrl() { return base + "/mission-control-viewer/"; }
+
+    /** Nom affiché : nom saisi, sinon « IP · fin du SN » (ou l'IP seule tant que le SN est inconnu). */
+    public String label() {
+        if (!name.isEmpty()) return name;
+        String t = snTail(serial);
+        return t.isEmpty() ? host() : host() + " · " + t;
+    }
+
+    public static String snTail(String sn) {
+        if (sn == null) return "";
+        sn = sn.trim();
+        if (sn.isEmpty()) return "";
+        int i = sn.lastIndexOf('-');
+        if (i >= 0 && i < sn.length() - 1) return sn.substring(i + 1);
+        return sn.length() > 5 ? sn.substring(sn.length() - 5) : sn;
+    }
+
+    private static final class NotFound extends Exception { NotFound(String m) { super(m); } }
+
     private JSONObject get(String path) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
         c.setConnectTimeout(4000);
@@ -43,6 +85,7 @@ public final class Cosmos {
         c.setRequestProperty("Accept", "application/json");
         try {
             int code = c.getResponseCode();
+            if (code == 404 || code == 405) throw new NotFound("HTTP " + code + " sur " + path);
             if (code != 200) throw new Exception("HTTP " + code + " sur " + path);
             try (InputStream in = c.getInputStream()) {
                 ByteArrayOutputStream bo = new ByteArrayOutputStream();
@@ -56,10 +99,52 @@ public final class Cosmos {
         }
     }
 
+    /**
+     * Identité : /api/machine/device (logiciel récent, ex. 2.2.0 : serial, model, software),
+     * sinon /api/machine/profile (ancien logiciel, ex. 1.5.x : serial_number, model,
+     * equipment_properties.manager.firmware.version). Lue une fois, réessayée chaque minute si inconnue.
+     */
+    private void readIdentity() {
+        if (!serial.isEmpty() || System.currentTimeMillis() < nextIdentityTry) return;
+        nextIdentityTry = System.currentTimeMillis() + 60_000;
+        if (!deviceUnsupported) {
+            try {
+                JSONObject dev = get("/api/machine/device");
+                serial = str(dev, "serial");
+                model = str(dev, "model");
+                firmware = str(dev, "software");
+                if (!serial.isEmpty()) return;
+            } catch (NotFound e) {
+                deviceUnsupported = true;
+            } catch (Exception ignored) { }
+        }
+        try {
+            JSONObject prof = get("/api/machine/profile");
+            String sn = str(prof, "serial_number");
+            if (!sn.isEmpty()) serial = sn;
+            if (model.isEmpty()) model = str(prof, "model");
+            if (firmware.isEmpty()) {
+                JSONObject ep = prof.optJSONObject("equipment_properties");
+                JSONObject mg = ep != null ? ep.optJSONObject("manager") : null;
+                JSONObject fw = mg != null ? mg.optJSONObject("firmware") : null;
+                firmware = str(fw, "version");
+            }
+        } catch (Exception ignored) { }
+    }
+
     public Status fetch() {
+        Status s = fetchStats();
+        s.serial = serial;
+        s.model = model;
+        s.firmware = firmware;
+        return s;
+    }
+
+    private Status fetchStats() {
         Status s = new Status();
         try {
             JSONObject stats = get("/api/printer/stats");
+            readIdentity();
             JSONObject last = null;
             try { last = get("/api/job/"); } catch (Exception ignored) { }
 
@@ -161,11 +246,17 @@ public final class Cosmos {
                     }
                 }
             }
+            for (int i = 0; i < heaters.length(); i++) {
+                JSONObject h = heaters.optJSONObject(i);
+                if (h != null && str(h, "name").equalsIgnoreCase("Chamber")) s.chamber = num(h, "actual");
+            }
             if (gotExt) return;
         }
         JSONObject t = stats.optJSONObject("temperature");
         if (t != null) {
             Double b = num(t, "bed");
+            Double en = num(t, "enclosure");
+            if (en != null) s.chamber = en;
             if (b != null) { s.bed = b; s.hasTemps = true; }
             JSONArray nz = t.optJSONArray("nozzles");
             if (nz != null) for (int i = 0; i < nz.length(); i++) {

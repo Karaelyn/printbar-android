@@ -37,7 +37,7 @@ jobs:
       - name: Rename
         id: apk
         run: |
-          V="1.0.${GITHUB_RUN_NUMBER}"
+          V="1.1.${GITHUB_RUN_NUMBER}"
           cp app/build/outputs/apk/release/app-release.apk "PrintBar-v${V}.apk"
           echo "version=${V}" >> "$GITHUB_OUTPUT"
 

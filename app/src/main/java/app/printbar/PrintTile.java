@@ -39,17 +39,29 @@ public class PrintTile extends TileService {
         Tile t = getQsTile();
         if (t == null) return;
         t.setState(PrintService.running ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
-        Cosmos.Status s = PrintService.last;
         if (Build.VERSION.SDK_INT >= 29) {
             String sub = null;
-            if (PrintService.running && s != null) {
-                switch (s.state) {
-                    case PRINTING: sub = (int) (s.progress * 100) + " %"; break;
-                    case PAUSED: sub = "En pause"; break;
-                    case COMPLETE: sub = "Terminé"; break;
-                    case OFFLINE: sub = "Injoignable"; break;
-                    default: sub = "Au repos"; break;
+            if (PrintService.running) {
+                // Machines qui impriment : « 42 % · 7 % » ; sinon un résumé
+                StringBuilder act = new StringBuilder();
+                int ready = 0, off = 0, done = 0;
+                for (PrintService.Watch w : PrintService.watches) {
+                    Cosmos.Status s = w.last;
+                    if (s == null) continue;
+                    switch (s.state) {
+                        case PRINTING: case PAUSED:
+                            if (act.length() > 0) act.append(" · ");
+                            act.append(s.heating() ? "chauffe" : (int) (s.progress * 100) + " %");
+                            break;
+                        case COMPLETE: done++; break;
+                        case OFFLINE: off++; break;
+                        default: ready++; break;
+                    }
                 }
+                if (act.length() > 0) sub = act.toString();
+                else if (done > 0) sub = "Terminé";
+                else if (ready > 0) sub = ready > 1 ? ready + " prêtes" : "Prête";
+                else if (off > 0) sub = "Injoignable";
             }
             t.setSubtitle(sub);
         }

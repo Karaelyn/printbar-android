@@ -27,7 +27,7 @@ public class MainActivity extends Activity {
 
     static final String EXTRA_START = "start";
 
-    private EditText url, poll;
+    private EditText printers, poll;
     private Button toggle;
     private TextView status;
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -54,16 +54,17 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView sub = new TextView(this);
-        sub.setText("Avancement de l'imprimante 3D dans les notifications. Le téléphone doit être sur le même réseau que l'imprimante.");
+        sub.setText("Avancement des imprimantes 3D dans les notifications, une par machine. Le téléphone doit être sur le même réseau que les machines.");
         sub.setPadding(0, dp(4), 0, dp(20));
         root.addView(sub);
 
-        root.addView(label("Adresse de l'imprimante"));
-        url = new EditText(this);
-        url.setSingleLine(true);
-        url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        url.setText(sp.getString(Prefs.URL, Prefs.DEFAULT_URL));
-        root.addView(url);
+        root.addView(label("Machines : une adresse par ligne, ou « Nom = adresse ». Sans nom, la machine s'affiche « IP · fin du SN »."));
+        printers = new EditText(this);
+        printers.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_VARIATION_URI);
+        printers.setMinLines(2);
+        printers.setGravity(Gravity.TOP | Gravity.START);
+        printers.setText(Prefs.printersText(this));
+        root.addView(printers);
 
         root.addView(label("Intervalle d'interrogation (s), écran allumé"));
         poll = new EditText(this);
@@ -83,13 +84,6 @@ public class MainActivity extends Activity {
         battery.setOnClickListener(v -> askBattery());
         root.addView(battery, new LinearLayout.LayoutParams(-1, -2));
 
-        Button web = new Button(this);
-        web.setText("Ouvrir l'interface de l'imprimante");
-        web.setOnClickListener(v -> {
-            save();
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(new Cosmos(url.getText().toString()).baseUrl())));
-        });
-        root.addView(web, new LinearLayout.LayoutParams(-1, -2));
 
         status = new TextView(this);
         status.setPadding(0, dp(20), 0, 0);
@@ -97,7 +91,7 @@ public class MainActivity extends Activity {
         root.addView(status);
 
         TextView tip = new TextView(this);
-        tip.setText("Astuce : ajoute la tuile « PrintBar » dans les Réglages rapides pour activer/couper le suivi sans ouvrir l'appli.");
+        tip.setText("Appuyer sur la notification d'une machine ouvre sa page Mission Control.\nAstuce : ajoute la tuile « PrintBar » dans les Réglages rapides pour activer/couper le suivi sans ouvrir l'appli.");
         tip.setPadding(0, dp(20), 0, 0);
         tip.setAlpha(0.7f);
         root.addView(tip);
@@ -156,10 +150,14 @@ public class MainActivity extends Activity {
         int p;
         try { p = Integer.parseInt(poll.getText().toString().trim()); } catch (Exception e) { p = 5; }
         p = Math.max(2, Math.min(60, p));
+        String list = printers.getText().toString().trim();
+        if (Prefs.parse(list).isEmpty()) list = Prefs.DEFAULT_PRINTERS;
         Prefs.get(this).edit()
-                .putString(Prefs.URL, url.getText().toString().trim())
+                .putString(Prefs.PRINTERS, list)
                 .putInt(Prefs.POLL, p)
                 .apply();
+        // Suivi déjà lancé : on le relance avec la nouvelle liste
+        if (PrintService.running) PrintService.start(this);
     }
 
     private void askBattery() {
@@ -178,28 +176,31 @@ public class MainActivity extends Activity {
 
     private void refresh() {
         toggle.setText(PrintService.running ? "Arrêter le suivi" : "Démarrer le suivi");
-        Cosmos.Status s = PrintService.last;
         if (!PrintService.running) {
             status.setText("Suivi arrêté.");
             return;
         }
-        if (s == null) {
-            status.setText("Connexion…");
-            return;
-        }
-        long ago = (System.currentTimeMillis() - PrintService.lastAt) / 1000;
         StringBuilder t = new StringBuilder();
-        t.append("État : ").append(label(s.state));
-        if (!s.file.isEmpty()) t.append("\nFichier : ").append(Cosmos.name(s.file));
-        if (s.state == Cosmos.State.PRINTING || s.state == Cosmos.State.PAUSED) {
-            t.append("\nProgression : ").append((int) (s.progress * 100)).append(" %");
-            if (s.totalLayers > 0) t.append(" · couche ").append(s.layer).append("/").append(s.totalLayers);
-            if (s.elapsedS >= 0) t.append("\nÉcoulé : ").append(Cosmos.dur(s.elapsedS));
-            if (s.remainingS >= 0) t.append("\nRestant : ").append(Cosmos.dur(s.remainingS));
+        for (PrintService.Watch w : PrintService.watches) {
+            if (t.length() > 0) t.append("\n\n");
+            t.append(w.client.label()).append("\n");
+            Cosmos.Status s = w.last;
+            if (s == null) { t.append("Connexion…"); continue; }
+            t.append("État : ").append(s.heating() ? "chauffe" : label(s.state));
+            if (!s.file.isEmpty()) t.append("\nFichier : ").append(Cosmos.name(s.file));
+            if (s.active() && !s.heating()) {
+                t.append("\nProgression : ").append((int) (s.progress * 100)).append(" %");
+                if (s.totalLayers > 0) t.append(" · couche ").append(s.layer).append("/").append(s.totalLayers);
+                if (s.elapsedS >= 0) t.append("\nÉcoulé : ").append(Cosmos.dur(s.elapsedS));
+                if (s.remainingS >= 0) t.append("\nRestant : ").append(Cosmos.dur(s.remainingS));
+            }
+            String temps = PrintService.temps(s);
+            if (!temps.isEmpty()) t.append("\n").append(temps);
+            String id = PrintService.ident(s);
+            if (!id.isEmpty()) t.append("\n").append(id);
+            if (!s.message.isEmpty()) t.append("\nDétail : ").append(s.message);
+            t.append("\nMis à jour il y a ").append((System.currentTimeMillis() - w.lastAt) / 1000).append(" s");
         }
-        if (s.hasTemps) t.append("\nBuse ").append(Math.round(s.ext)).append(" °C · Plateau ").append(Math.round(s.bed)).append(" °C");
-        if (!s.message.isEmpty()) t.append("\nDétail : ").append(s.message);
-        t.append("\n\nDernière mise à jour il y a ").append(ago).append(" s");
         status.setText(t);
     }
 
